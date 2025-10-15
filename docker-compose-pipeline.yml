@@ -1,0 +1,178 @@
+version: '3.8'
+
+networks:
+  llm-rag-network:
+    driver: bridge
+
+volumes:
+  pdf_input:
+  txt_processed:
+  embeddings_data:
+  chromadb_data:
+  redis_data:
+
+services:
+  # ==================== 数据摄取服务 ====================
+  pdf-ingestion:
+    build:
+      context: .
+      dockerfile: Dockerfile.pdf-ingestion
+    container_name: pdf-ingestion
+    networks:
+      - llm-rag-network
+    volumes:
+      - pdf_input:/app/input
+      - txt_processed:/app/output
+      - ../secrets:/secrets
+    environment:
+      - GCP_PROJECT=${GCP_PROJECT}
+      - GOOGLE_APPLICATION_CREDENTIALS=/secrets/llm-service-account.json
+      - REDIS_URL=redis://redis:6379
+      - OUTPUT_DIR=/app/output
+    depends_on:
+      - redis
+    restart: unless-stopped
+    command: ["python", "pdf_ingestion_service.py"]
+
+  # ==================== 文本预处理服务 ====================
+  text-processor:
+    build:
+      context: .
+      dockerfile: Dockerfile.text-processor
+    container_name: text-processor
+    networks:
+      - llm-rag-network
+    volumes:
+      - txt_processed:/app/input
+      - embeddings_data:/app/output
+      - ../secrets:/secrets
+    environment:
+      - GCP_PROJECT=${GCP_PROJECT}
+      - GOOGLE_APPLICATION_CREDENTIALS=/secrets/llm-service-account.json
+      - REDIS_URL=redis://redis:6379
+      - INPUT_DIR=/app/input
+      - OUTPUT_DIR=/app/output
+    depends_on:
+      - redis
+      - pdf-ingestion
+    restart: unless-stopped
+    command: ["python", "text_processor_service.py"]
+
+  # ==================== RAG处理服务 ====================
+  rag-processor:
+    build:
+      context: .
+      dockerfile: Dockerfile.rag-processor
+    container_name: rag-processor
+    networks:
+      - llm-rag-network
+    volumes:
+      - embeddings_data:/app/input
+      - ../secrets:/secrets
+    environment:
+      - GCP_PROJECT=${GCP_PROJECT}
+      - GOOGLE_APPLICATION_CREDENTIALS=/secrets/llm-service-account.json
+      - REDIS_URL=redis://redis:6379
+      - CHROMADB_HOST=chromadb
+      - CHROMADB_PORT=8000
+      - INPUT_DIR=/app/input
+    depends_on:
+      - redis
+      - chromadb
+      - text-processor
+    restart: unless-stopped
+    command: ["python", "rag_processor_service.py"]
+
+  # ==================== 查询服务 ====================
+  query-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.query-service
+    container_name: query-service
+    networks:
+      - llm-rag-network
+    ports:
+      - "8001:8001"
+    volumes:
+      - ../secrets:/secrets
+    environment:
+      - GCP_PROJECT=${GCP_PROJECT}
+      - GOOGLE_APPLICATION_CREDENTIALS=/secrets/llm-service-account.json
+      - CHROMADB_HOST=chromadb
+      - CHROMADB_PORT=8000
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - chromadb
+      - redis
+      - rag-processor
+    restart: unless-stopped
+    command: ["python", "query_service.py"]
+
+  # ==================== 支持服务 ====================
+  
+  # 向量数据库
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: chromadb
+    networks:
+      - llm-rag-network
+    ports:
+      - "8000:8000"
+    volumes:
+      - chromadb_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+      - CHROMA_CORS_ALLOW_ORIGINS=["*"]
+    restart: unless-stopped
+
+  # 缓存和消息队列
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    networks:
+      - llm-rag-network
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+
+  # API网关和负载均衡
+  nginx:
+    image: nginx:alpine
+    container_name: nginx
+    networks:
+      - llm-rag-network
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      - query-service
+    restart: unless-stopped
+
+  # ==================== 管道控制服务 ====================
+  pipeline-controller:
+    build:
+      context: .
+      dockerfile: Dockerfile.pipeline-controller
+    container_name: pipeline-controller
+    networks:
+      - llm-rag-network
+    volumes:
+      - pdf_input:/app/input
+      - ../secrets:/secrets
+    environment:
+      - GCP_PROJECT=${GCP_PROJECT}
+      - REDIS_URL=redis://redis:6379
+      - PIPELINE_MODE=event-driven
+    depends_on:
+      - redis
+      - pdf-ingestion
+      - text-processor
+      - rag-processor
+    restart: unless-stopped
+    command: ["python", "pipeline_controller.py"]
